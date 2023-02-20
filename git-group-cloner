@@ -1,0 +1,698 @@
+#!/bin/dash
+
+# Default values for environment variables
+GITLAB_BASE_URL=${GITLAB_BASE_URL:-https://gitlab.com}
+GITHUB_BASE_URL=${GITHUB_BASE_URL:-https://api.github.com}
+REQUEST_TOOL="curl"
+
+# Error messages
+ERROR_EMPTY_TOKEN='Error: empty token provided'
+ERROR_GROUP_NOT_FOUND='Error: group not found'
+ERROR_INVALID_ENTITY_TYPE='Error: invalid entity type'
+ERROR_INVALID_JSON='Error: API response is not a valid JSON'
+ERROR_INVALID_TOKEN='Error: invalid or expired token'
+ERROR_INVALID_URL='Error: Invalid URL'
+ERROR_MISSING_DEPENDENCY='Error: required dependency missing'
+ERROR_MULTIPLE_GROUPS_FOUND='Error: multiple groups found with the same name'
+ERROR_NEITHER_CURL_NOR_WGET='Neither curl nor wget was found. Please install one of them and try again.'
+ERROR_NOT_ARRAY='Error: API response is not an array'
+ERROR_NOT_OBJECT='Error: response is not a valid JSON object'
+ERROR_PARSING='Error in parsing options'
+ERROR_UNKNOWN_ENTITY_TYPE='Error: Unable to determine entity type'
+ERROR_UNSUPPORTED_ACTION='Error: unsupported action'
+ERROR_UNSUPPORTED_PLATFORM='Error: unsupported platform'
+ERROR_UNSUPPORTED_SUBGROUPS='Error: subgroups not supported for GitHub platform'
+ERROR_UNSUPPORTED_TYPE='Error: unsupported type'
+
+# logging functions
+log() {
+    printf '%s\n' "$1" >&2
+}
+
+error() {
+    printf '%s\n' "$1"
+    exit 1
+}
+
+# This function filters JSON input using jq and prints the results.
+filter_json_with_jq() {
+    jq_query="$1"
+    jq -r "$jq_query"
+}
+
+# Argument parsing function
+parse_arguments() {
+
+    # parse command line options using getopt
+    if ! options=$(getopt -o h --long help,flatten,git-args:,dest-dir:,threads:,use-ssh -n 'git-group-cloner' -- "$@"); then
+        error "$ERROR_PARSING"
+    fi
+
+    # set positional parameters
+    eval set -- "$options"
+
+    # Set default values for options
+    flatten=false
+    git_args=''
+    dest_dir=''
+    threads=4
+    use_ssh=false
+
+    # process options
+    while true; do
+        case $1 in
+        --flatten)
+            flatten=true
+            shift
+            ;;
+        --git-args)
+            git_args="$2"
+            shift 2
+            ;;
+        --dest-dir)
+            dest_dir="$2"
+            shift 2
+            ;;
+        --threads)
+            threads="$2"
+            shift 2
+            ;;
+        --use-ssh)
+            use_ssh=true
+            shift
+            ;;
+        -h | --help)
+            log 'Usage: git-group-cloner platform list|clone <group_name_or_id> [--flatten] [--git-args <git-arguments>] [--dest-dir <destination_directory>] [--threads <number_of_threads>] [--use-ssh]'
+            exit 0
+            ;;
+        --)
+            shift
+            break
+            ;;
+        *)
+            error "$ERROR_PARSING"
+            ;;
+        esac
+    done
+
+    # Get the platform and action (list or clone)
+    if [ $# -lt 3 ]; then
+        error 'Error: platform, action and group name or ID are required'
+    fi
+
+    # set platform
+    platform=$1
+
+    # set action
+    action=$2
+
+    # set group name / id
+    group_name_or_id=$3
+
+    # check if platform is supported
+    if [ "$platform" != 'gitlab' ] && [ "$platform" != 'github' ]; then
+        error "$ERROR_UNSUPPORTED_PLATFORM"
+    fi
+
+    # check if action is supported
+    if [ "$action" != 'list' ] && [ "$action" != 'clone' ]; then
+        error "$ERROR_UNSUPPORTED_ACTION"
+    fi
+
+    if [ "$platform" = 'github' ]; then
+        flatten=true
+    fi
+}
+
+# Dependency check function
+check_dependencies() {
+    platform="$1"
+    token="$2"
+
+    # check if jq is installed
+    if ! command -v jq >/dev/null; then
+        error "$ERROR_MISSING_DEPENDENCY: jq is not installed"
+    fi
+
+    # check if git is installed
+    if ! command -v git >/dev/null; then
+        error "$ERROR_MISSING_DEPENDENCY: git is not installed"
+    fi
+
+    # Determine the appropriate tool for making the request
+
+    # Check if curl exists
+    if command -v curl >/dev/null; then
+        REQUEST_TOOL="curl"
+    # Check if wget exists
+    elif command -v wget >/dev/null; then
+        REQUEST_TOOL="wget"
+    else
+        error "$ERROR_NEITHER_CURL_NOR_WGET"
+    fi
+
+    # Check if the token is valid by making a request to a dummy endpoint
+    check_token "${platform}" "${token}"
+
+    # Check if xargs or rargs are available
+    if command -v xargs >/dev/null; then
+        PARALLEL_TOOL="xargs"
+    # FIXME: Unsupported for now
+    #elif command -v rargs >/dev/null; then
+    #    PARALLEL_TOOL="rargs"
+    else
+        PARALLEL_TOOL="none"
+    fi
+}
+
+# — Code related to HTTP requests
+
+# Return the base URL and header for the specified platform in a delimiter-separated string format to be used in API requests.
+get_platform_info() {
+    platform=$1
+    token="$2"
+    if [ -z "$token" ]; then
+        error "$ERROR_EMPTY_TOKEN"
+    fi
+    if [ "$platform" = 'gitlab' ]; then
+        base_url="$GITLAB_BASE_URL/api/v4"
+        header="PRIVATE-TOKEN: ${token}"
+    elif [ "$platform" = 'github' ]; then
+        base_url="$GITHUB_BASE_URL"
+        header="Authorization: token ${token}"
+    else
+        error "$ERROR_UNSUPPORTED_PLATFORM"
+    fi
+    printf '%s|%s\n' "$base_url" "$header"
+}
+# Make an HTTP GET request to the specified URL with the provided token and returns the response
+make_request() {
+    url="$1"
+    header="${2:-Authorization: Bearer $TOKEN}" # FIXME
+    #log "Making request to URL: $url"
+    #log "Request header: $header"
+    response_file=$(mktemp)
+    if [ "$REQUEST_TOOL" = 'curl' ]; then
+        request_cmd="curl -L -s -w '%{http_code}\\n'"
+        header_opt="-H"
+    else
+        request_cmd="wget --no-check-certificate -q -S --server-response"
+    fi
+    http_code=$($request_cmd "$header_opt" "$header" "${url}" -o "$response_file" 2>&1)
+    http_code=$(printf '%s' "$http_code" | tr -d '\n' | tr -d "'")
+    response=$(cat "$response_file")
+    if [ "$http_code" != "200" ]; then
+        error "Error: API returned an unexpected HTTP status code $http_code. Response: $response"
+    fi
+    rm "$response_file"
+    #log "response=${response}"
+    # Check if the response is a valid JSON
+    if ! printf '%s' "$response" | jq type 1>/dev/null; then
+        error "$ERROR_INVALID_JSON"
+    fi
+    printf '%s' "$response"
+}
+
+# Make a request to the API for the specified platform and entity and retrieve all pages of data
+#
+# The function takes the platform, entity ID, type of request, and API token as its inputs.
+# The type of request can be either 'subgroups' or 'projects'.
+# The function outputs the response from the API in JSON format.
+# If the platform, entity ID, type of request, or API token are invalid, the function outputs an error message and returns a non-zero exit status.
+make_api_request() {
+    platform=$1
+    entity_id=$2
+    type=$3
+    token="$4"
+
+    platform_info=$(get_platform_info "$platform" "$token")
+    base_url=${platform_info%'|'*}
+    header=${platform_info#*'|'}
+
+    if [ "$platform" = 'gitlab' ]; then
+        if [ "$type" = 'subgroups' ]; then
+            url="$base_url/groups/$entity_id/subgroups?per_page=100"
+        elif [ "$type" = 'projects' ]; then
+            url="$base_url/groups/$entity_id/projects?per_page=100"
+        else
+            error "$ERROR_UNSUPPORTED_TYPE"
+        fi
+    elif [ "$platform" = 'github' ]; then
+        entity_type=$(determine_github_entity_type "$entity_id" "$token")
+        if [ "$type" = 'subgroups' ]; then
+            error "$ERROR_UNSUPPORTED_SUBGROUPS"
+        elif [ "$type" = 'projects' ]; then
+            if [ "$entity_type" = 'user' ]; then
+                url="$base_url/users/$entity_id/repos?per_page=100"
+            elif [ "$entity_type" = 'organization' ]; then
+                url="$base_url/orgs/$entity_id/repos?per_page=100"
+            else
+                error "$ERROR_INVALID_ENTITY_TYPE: $entity_type"
+            fi
+        else
+            error "$ERROR_UNSUPPORTED_TYPE"
+        fi
+    else
+        error "$ERROR_UNSUPPORTED_PLATFORM"
+    fi
+
+    # Retrieve all pages of data
+    all_data=""
+    while [ -n "$url" ]; do
+        response=$(make_request "${url}" "$header")
+        # Check if the response is a JSON array
+        if ! printf '%s' "$response" | jq -e '. | type == "array"' >/dev/null 2>&1; then
+            error "$ERROR_NOT_ARRAY"
+        fi
+        # Concatenate the response with previous data
+        all_data="$all_data$response"
+
+        if [ "$platform" = 'github' ]; then
+            # Extract the "Link" header from the response
+            link_header=$(printf '%s' "$response" | awk '/^Link:/')
+            # Extract the URL for the next page from the "Link" header
+            next_url=$(printf '%s' "$link_header" | sed -E 's/.*<(.*)>; rel="next".*/\1/')
+            url="$next_url"
+        else
+            # If the platform is GitLab, check if there is a "next" URL in the response
+            #next_url=$(printf '%s\n' "$response" | jq '._links.next.href')
+            #url="$next_url"
+            # FIXME
+            url=""
+        fi
+    done
+    printf '%s' "$all_data"
+}
+
+# Check if the token is valid by making a request to a dummy endpoint
+check_token() {
+    platform="$1"
+    token="$2"
+
+    platform_info=$(get_platform_info "$platform" "$token")
+    base_url=${platform_info%'|'*}
+    header=${platform_info#*'|'}
+
+    if [ -z "$token" ]; then
+        error "$ERROR_EMPTY_TOKEN"
+    fi
+    if [ "$platform" = 'gitlab' ]; then
+        response=$(make_request "${base_url}/projects" "$header")
+        if printf '%s' "$response" | grep -q "401 Unauthorized"; then
+            error "$ERROR_INVALID_TOKEN"
+        fi
+    elif [ "$platform" = 'github' ]; then
+        response=$(make_request "${base_url}/user" "$header")
+        if printf '%s' "$response" | grep -q "401 Bad credentials"; then
+            error "$ERROR_INVALID_TOKEN"
+        fi
+    else
+        error "$ERROR_UNSUPPORTED_PLATFORM"
+    fi
+}
+
+# Extract the platform and entity name from a URL
+#
+# The function takes a URL as its input, and outputs a string in the format:
+#   [platform]|[entity-name]
+#
+# The platform is either "gitlab" or "github", depending on which platform the URL belongs to.
+# The entity name refers to the entity that owns the repository, which could be a group, a user, or an organization, and is extracted from the URL.
+#
+# If the URL is not recognized as a valid GitLab or GitHub URL, the function outputs an error message and returns a non-zero exit status.
+parse_url() {
+    url=$1
+    if echo "$url" | grep -qE '^https://.*gitlab'; then
+        platform='gitlab'
+        entity=$(printf '%s' "$url" | sed -E 's|.*gitlab[^/]+/([^/]+)/([^/]+).*|\1/\2|')
+    elif echo "$url" | grep -qE '^https://.*github'; then
+        platform='github'
+        entity=$(printf '%s' "$url" | sed -E 's|.*github[^/]+/([^/]+).*|\1|')
+    else
+        printf '%s' "$ERROR_INVALID_URL"
+        return 1
+    fi
+    printf '%s|%s\n' "$platform" "$entity"
+}
+
+# Determine if the entity extracted from a GitHub URL is a user or an organization
+#
+# The function takes the entity name as its input and outputs either "user" or "organization".
+#
+# If the entity name is not recognized as a valid user or organization, the function outputs an error message and returns a non-zero exit status.
+determine_github_entity_type() {
+    entity_name=$1
+    token="$2"
+
+    platform_info=$(get_platform_info "github" "$token")
+    base_url=${platform_info%'|'*}
+    header=${platform_info#*'|'}
+    response=$(make_request "https://api.github.com/users/$entity_name" "$header")
+    if echo "$response" | grep -q '"type": "User"'; then
+        entity_type="user"
+    elif echo "$response" | grep -q '"type": "Organization"'; then
+        entity_type="organization"
+    else
+        error "$ERROR_UNKNOWN_ENTITY_TYPE for $entity_name"
+    fi
+    printf '%s\n' "$entity_type"
+}
+
+# Function to get the entity ID from the entity name
+get_entity_id() {
+    platform=$1
+    entity_name=$2
+    token="$3"
+    platform_info=$(get_platform_info "$platform" "$token")
+    base_url=${platform_info%'|'*}
+    header=${platform_info#*'|'}
+
+    if [ "$platform" = 'gitlab' ]; then
+        url="${base_url}/groups?search=${entity_name}&simple=yes"
+        response=$(make_request "${url}" "$header")
+        entities=$(printf '%s' "$response" | jq -r '.[].id')
+    elif [ "$platform" = 'github' ]; then
+        entity_type=$(determine_github_entity_type "$entity_name" "$token")
+        if [ "$entity_type" = 'user' ]; then
+            url="${base_url}/users/${entity_name}"
+        elif [ "$entity_type" = 'organization' ]; then
+            url="${base_url}/orgs/${entity_name}"
+        else
+            error "Error: Invalid entity type: $entity_type"
+        fi
+        response=$(make_request "${url}" "$header")
+        entities=$(printf '%s' "$response" | jq -r '.id')
+    else
+        error "$ERROR_UNSUPPORTED_PLATFORM"
+    fi
+
+    if [ -z "$entities" ]; then
+        #log "Response from API: $response"
+        error "$ERROR_GROUP_NOT_FOUND: ${entity_name}"
+    fi
+
+    if [ "$(printf '%s' "$entities" | wc -l)" -gt 1 ]; then
+        error "$ERROR_MULTIPLE_GROUPS_FOUND"
+    fi
+
+    printf '%s' "$entities"
+}
+
+# List either subgroups or projects, or both for a given entity ID
+# Defaults to listing both if no type is specified
+list_entity_items() {
+    platform="$1"
+    entity_id="$2"
+    token="$3"
+    type="$4"
+
+    response=$(make_api_request "$platform" "$entity_id" "$type" "$token")
+    items=$(printf '%s' "$response" | jq -c '.[]')
+    if [ -z "$items" ]; then
+        return
+    fi
+
+    # Loop through each item in the response
+    printf '%s\n' "$items" | while read -r item; do
+        # Ensure the item is an object
+        if ! printf '%s' "$item" | jq -e '. | type == "object"' >/dev/null 2>&1; then
+            log "$ERROR_NOT_OBJECT: $type: $item"
+            continue
+        fi
+        item_id=$(printf '%s' "$item" | jq -r '.id')
+        if [ -z "$item_id" ]; then
+            continue
+        fi
+        item_name=$(printf '%s' "$item" | jq -r '.name')
+        if [ -z "$item_name" ]; then
+            continue
+        fi
+        # Determine the type of the item and set the prefix accordingly
+        if [ "$type" = "projects" ]; then
+            prefix="Project"
+        elif [ "$type" = "groups" ]; then
+            prefix="Subgroup"
+        else
+            prefix="Subgroup"
+        fi
+        printf '%s\n' "${prefix} - $item_id - $item_name"
+    done
+}
+
+# List all projects for a given group ID
+list_entity_projects() {
+    list_entity_items "$@" projects
+}
+
+# List all subgroups for a given group ID
+list_entity_subgroups() {
+    list_entity_items "$@" subgroups
+}
+
+# List either subgroups or projects, or both for a given entity
+# Defaults to listing both if no type is specified
+list_entity() {
+    platform=$1
+    entity_id=$2
+    token="$3"
+    type_=${4:-both}
+
+    #log "list_entity $platform $entity_id $type_"
+    if [ "$type_" = 'subgroups' ] || [ "$type_" = 'both' ]; then
+        list_entity_subgroups "$platform" "$entity_id" "$token"
+    fi
+    if [ "$type_" = 'projects' ] || [ "$type_" = 'both' ]; then
+        list_entity_projects "$platform" "$entity_id" "$token"
+    fi
+}
+
+list_github_org() {
+    org=$1
+    token="$2"
+
+    response=$(make_api_request "github" "$org" projects "$token")
+    items=$(printf '%s' "$response" | jq -c '.[]')
+    if [ -z "$items" ]; then
+        return
+    fi
+
+    printf '%s\n' "$items" | while read -r item; do
+        if ! printf '%s' "$item" | jq -e '. | type == "object"' >/dev/null 2>&1; then
+            log "$ERROR_NOT_OBJECT: projects: $item"
+            continue
+        fi
+        item_id=$(printf '%s' "$item" | jq -r '.id')
+        if [ -z "$item_id" ]; then
+            continue
+        fi
+        item_name=$(printf '%s' "$item" | jq -r '.name')
+        if [ -z "$item_name" ]; then
+            continue
+        fi
+        printf '%s\n' "Project - $item_id - $item_name"
+    done
+}
+
+# This function retrieves all projects in an entity on a specified platform (either GitLab or GitHub),
+# given the entity identifier and the platform.
+# The function uses a recursive approach to traverse the entity and its subgroups, if any, to retrieve all projects.
+# The retrieved projects are output to the console as URLs to the repositories, along with the namespace.full_path field
+# (separated by a "|").
+#
+# Arguments:
+#   platform: the platform to retrieve the projects from (either "gitlab" or "github")
+#   entity_id: the identifier of the entity to retrieve projects from (either a name or an ID, depending on the platform)
+#   use_ssh: a boolean indicating whether to use SSH URLs for the projects (true) or HTTP URLs (false)
+#   token: the authentication token to use for the API requests
+#
+# Returns:
+#   The URLs of the repositories for the retrieved projects, separated by a "|", and the namespace.full_path field,
+#   one URL per line.
+get_projects() {
+    platform="$1"
+    entity_id="$2"
+    use_ssh="$3"
+    token="$4"
+
+    if ! response=$(make_api_request "$platform" "$entity_id" "projects" "$token"); then
+        error "$response"
+    fi
+
+    # Determine the jq query to use, based on the platform and the use_ssh argument.
+    if [ "$platform" = 'gitlab' ]; then
+        if [ "$use_ssh" = 'true' ]; then
+            jq_query='.[] | .ssh_url_to_repo + "|" + .namespace.full_path'
+        else
+            jq_query='.[] | .http_url_to_repo + "|" + .namespace.full_path'
+        fi
+    elif [ "$platform" = 'github' ]; then
+        if [ "$use_ssh" = 'true' ]; then
+            jq_query='.[] | .ssh_url'
+        else
+            jq_query='.[] | .clone_url'
+        fi
+    fi
+
+    printf '%s\n' "$response" | filter_json_with_jq "$jq_query"
+
+    # If the platform is GitLab, retrieve the subgroups and call this function recursively for each subgroup.
+    if [ "$platform" = 'gitlab' ]; then
+        response=$(make_api_request "$platform" "$entity_id" "subgroups" "$token")
+
+        # Read the subgroup ids from the response and store them in a string separated by newline characters.
+        subgroup_ids=$(printf '%s\n' "$response" | filter_json_with_jq '.[].id' | tr '\n' ' ')
+
+        # Stop looping if subgroup_ids is empty
+        if [ -z "$subgroup_ids" ]; then
+            return
+        fi
+
+        # Loop over the subgroup ids and call the get_projects function recursively for each subgroup.
+        for subgroup_id in $subgroup_ids; do
+            get_projects "$platform" "$subgroup_id" "$use_ssh" "$token"
+        done
+    fi
+}
+
+# run_commands - a function to execute commands in either sequential or parallel mode
+#
+# Usage: run_commands [threads]
+#
+# Arguments:
+#   threads - the number of threads to use for parallel execution (default: 1)
+#
+# Input:
+#   The function takes its input from standard input. The input should contain a list of
+#   commands, one command per line.
+#
+# Output:
+#   The function writes its output to standard output. The output will contain the output
+#   of the executed commands.
+#
+# Notes:
+#   If the 'threads' argument is 1, the commands will be executed sequentially.
+#   If the 'threads' argument is greater than 1, the commands will be executed in parallel
+#   using xargs. The order of the output is not predictable when executing commands in parallel.
+run_commands() {
+  # Set the default number of threads to 1
+  threads=${1:-1}
+
+  # If the number of threads is 1, execute the commands sequentially
+  if [ "$threads" -eq 1 ]; then
+    while read -r cmd; do
+      eval "$cmd" || exit 1
+    done
+  # If the number of threads is greater than 1, execute the commands in parallel
+  else
+    xargs -P "$threads" -I {} sh -c "{}" || exit 1
+  fi
+}
+
+
+# Run 'git clone' commands for a list of repositories.
+# If cloning is set to "sequential", the clones will run sequentially, otherwise they will run in parallel using xargs.
+# This code should be POSIX-compliant.
+# Note: For GitLab repositories, the input will include the repository URL and the path_with_namespace, separated by a "|".
+run_git_clones() {
+    git_args="$1"
+    dest_dir="$2"
+    cloning="$3"
+    threads="$4"
+    flatten="$5"
+
+    while read -r line; do
+        url=${line%'|'*}
+        repo_name=${url##*/}
+        namespace_path=${line#*'|'}
+        if [ "$flatten" = "true" ]; then
+            dest_path="$dest_dir/$repo_name"
+        else
+            dest_path="$dest_dir/$namespace_path/$repo_name"
+        fi
+
+        # Generate the 'git clone' command for each repository
+        echo "git clone $git_args $url $dest_path"
+    done | run_commands "$threads"
+}
+
+# Function to clone all projects in an entity
+clone_projects() {
+    platform=$1
+    entity_id=$2
+    use_ssh=$3
+    flatten=$4
+    git_args=$5
+    dest_dir=$6
+    threads=$7
+    token="$8"
+
+    # Check if destination directory exists, and create it if it does not exist
+    if [ ! -d "$dest_dir" ]; then
+        mkdir -p "$dest_dir"
+    fi
+
+    # Check if destination directory is empty, and exit with an error message if it is not
+    if [ "$(ls -A "$dest_dir")" ]; then
+        error "Error: destination directory '$dest_dir' is not empty"
+    fi
+
+    if [ "$threads" -le 1 ] || [ "$PARALLEL_TOOL" = "none" ]; then
+        cloning="sequential"
+    elif [ "$PARALLEL_TOOL" = "rargs" ]; then
+        cloning="parallel_rargs"
+    else
+        cloning="parallel_xargs"
+    fi
+    #cloning="sequential" # FIXME
+    #cloning="parallel_rargs"
+
+    # Get the list of projects and pass each project to run_git_clones
+    get_projects "$platform" "$entity_id" "${use_ssh}" "${token}" |
+        run_git_clones "$git_args" "$dest_dir" "$cloning" "$threads" "$flatten"
+
+}
+
+# main function
+main() {
+    platform="$1"
+    action="$2"
+    group_name_or_id="$3"
+    use_ssh="$4"
+    token="$5"
+
+    # Call the dependency check function
+    check_dependencies "${platform}" "${token}"
+
+    if printf '%s' "$group_name_or_id" | grep -E '^[0-9]+$' >/dev/null; then
+        # If the argument is a number, use it as the group ID
+        entity_id="$group_name_or_id"
+    else
+        # If the argument is not a number, use it as the group name
+        entity_id=$(get_entity_id "$platform" "$group_name_or_id" "$token")
+    fi
+
+    if [ "$action" = 'list' ]; then
+        list_entity "$platform" "$entity_id" "$token"
+    elif [ "$action" = 'clone' ]; then
+        if [ -z "$entity_id" ]; then
+            error 'Error: group ID is required'
+        fi
+        clone_projects "$platform" "$entity_id" "$use_ssh" "$flatten" "$git_args" "$dest_dir" "$threads" "$token"
+    else
+        error "$ERROR_UNSUPPORTED_ACTION"
+    fi
+}
+
+#script_path="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+#log "script_path=$script_path"
+#x="${BASH_SOURCE:-$0}"
+#log "x=$x"
+
+# shellcheck disable=3028
+if [ "$0" = "${BASH_SOURCE:-$0}" ]; then
+    # Call the argument parsing function
+    parse_arguments "$@"
+
+    # call main function
+    main "$platform" "$action" "$group_name_or_id" "$use_ssh" "$TOKEN"
+fi
